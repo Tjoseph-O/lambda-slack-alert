@@ -54,25 +54,42 @@ def init_mongodb_connection():
     
     if mongodb_client is None:
         
-        secrets_client = boto3.client('secretsmanager')
-        secret_response = secrets_client.get_secret_value(
-            SecretId='transaction-alerts/mongodb-credentials'
-        )
-        secrets = json.loads(secret_response['SecretString'])
+        ssm_client = boto3.client('ssm')
+        param_base = os.environ.get('MONGODB_PARAM_BASE', '/power-alerts/dev/mongodb')
+
+        try:
+
+            uri_param = ssm_client.get_parameter(
+                Name=f"{param_base}/uri",
+                WithDecryption=True
+            )
+            mongodb_uri = uri_param['Parameter']['Value']
+
+            db_param = ssm_client.get_parameter(
+                Name=f"{param_base}/database",
+            )
+            database_name = db_param['Parameter']['Value']
+            
+            print(f"📡 Connecting to MongoDB database: {database_name}")
         
         
-        mongodb_client = MongoClient(
-            secrets['mongodb_uri'],
-            serverSelectionTimeoutMS=15000,
-            connectTimeoutMS=15000,
-            maxPoolSize=5,
-            retryWrites=True
-        )
+        
+            mongodb_client = MongoClient(
+                mongodb_uri,
+                serverSelectionTimeoutMS=15000,
+                connectTimeoutMS=15000,
+                maxPoolSize=5,
+                retryWrites=True
+            )
         
         
-        database = mongodb_client['bill_vending']
+            database = mongodb_client[database_name]
         
-        print("✅ MongoDB connection initialized")
+            print("✅ MongoDB connection initialized")
+
+        except Exception as e:
+            print(f"❌ Error initializing MongoDB connection: {e}")
+            raise
 
 def get_report_period(current_time):
     hour = current_time.hour
@@ -239,10 +256,9 @@ def get_power_transaction_revenue(start_time, end_time):
 def send_revenue_alert(revenue_data, period_name, start_time, end_time):
     try:
         secrets_client = boto3.client('secretsmanager')
-        secret_response = secrets_client.get_secret_value(
-            SecretId='transaction-alerts/slack-webhook'
-        )
-        
+        secret_name = os.environ.get('SLACK_SECRET_NAME', 'power-alerts/dev/slack-webhook')
+        secret_response = secrets_client.get_secret_value(SecretId=secret_name)
+
         secret_string = secret_response['SecretString']
         print(f"🔐 Raw secret string: {secret_string[:50]}...")
         
@@ -262,93 +278,26 @@ def send_revenue_alert(revenue_data, period_name, start_time, end_time):
     
     time_display = f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')} UTC on {start_time.strftime('%Y-%m-%d')}"
     
+    # Use simple text format instead of complex blocks
     if revenue_data['total_transactions'] == 0:
-        message = {
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "⚡ Power Transaction Revenue Report"
-                    }
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*📅 Period:* {period_name}\n*🕐 Time:* {time_display}"
-                    }
-                },
-                {
-                    "type": "divider"
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": "📭 *No new transactions yet*\n\nNo power transactions were processed during this period."
-                    }
-                }
-            ]
-        }
+        message_text = f"⚡ *Power Transaction Revenue Report*\n\n📅 *Period:* {period_name}\n🕐 *Time:* {time_display}\n\n📭 *No new transactions yet*\n\nNo power transactions were processed during this period."
     else:
-        utility_text = ""
-        if revenue_data['utility_breakdown']:
-            utility_lines = []
-            for util_data in revenue_data['utility_breakdown']:
-                utility_lines.append(
-                    f"• *{util_data['util']}*: ₦{util_data['amount']:,.2f} ({util_data['transactions']} transactions)"
-                )
-            utility_text = "\n".join(utility_lines)
+        utility_lines = []
+        for util_data in revenue_data['utility_breakdown']:
+            utility_lines.append(f"• *{util_data['util']}*: ₦{util_data['amount']:,.2f} ({util_data['transactions']} transactions)")
+        utility_text = "\n".join(utility_lines)
         
-        message = {
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "⚡ Power Transaction Revenue Report"
-                    }
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*📅 Period:* {period_name}\n*🕐 Time:* {time_display}"
-                    }
-                },
-                {
-                    "type": "divider"
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*💰 Total Revenue Generated:*\n₦{revenue_data['total_amount']:,.2f}"
-                    }
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn", 
-                        "text": f"*📊 Total Transactions:* {revenue_data['total_transactions']:,}"
-                    }
-                },
-                {
-                    "type": "divider"
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*🏢 Revenue Breakdown by Utility:*\n{utility_text}"
-                    }
-                }
-            ]
-        }
+        message_text = f"⚡ *Power Transaction Revenue Report*\n\n📅 *Period:* {period_name}\n🕐 *Time:* {time_display}\n\n💰 *Total Revenue Generated:* ₦{revenue_data['total_amount']:,.2f}\n📊 *Total Transactions:* {revenue_data['total_transactions']:,}\n\n🏢 *Revenue Breakdown by Utility:*\n{utility_text}"
+
+    # Simple message format that works better with webhooks
+    message = {
+        "text": message_text
+    }
     
     try:
         print(f"📤 Sending message to Slack...")
+        print(f"📤 Message content: {json.dumps(message, indent=2)}")
+        
         response = requests.post(
             webhook_url,
             json=message,
@@ -361,6 +310,11 @@ def send_revenue_alert(revenue_data, period_name, start_time, end_time):
         
         if response.status_code != 200:
             raise Exception(f"Slack API error: {response.status_code} - {response.text}")
+        
+        if response.text.strip() == "ok":
+            print("✅ Slack message sent successfully!")
+        else:
+            print("⚠️ Unexpected response from Slack")
         
         if revenue_data['total_transactions'] == 0:
             print("📭 No transactions alert sent successfully!")
@@ -378,35 +332,26 @@ def send_revenue_alert(revenue_data, period_name, start_time, end_time):
 def send_error_alert(error_message):
     try:
         secrets_client = boto3.client('secretsmanager')
-        secret_response = secrets_client.get_secret_value(
-            SecretId='transaction-alerts/slack-webhook'
-        )
-        secrets = json.loads(secret_response['SecretString'])
-        webhook_url = secrets['webhook_url']
+        secret_name = os.environ.get('SLACK_SECRET_NAME', 'power-alerts/dev/slack-webhook')
+        secret_response = secrets_client.get_secret_value(SecretId=secret_name)
+        
+        try:
+            secrets = json.loads(secret_response['SecretString'])
+            webhook_url = secrets['webhook_url']
+        except json.JSONDecodeError:
+            webhook_url = secret_response['SecretString'].strip().strip('"')
         
         clean_error_msg = str(error_message).replace('"', "'").replace('\n', ' ')
         
+        # Simple text format for error messages too
+        error_text = f"🚨 *Power Transaction Alert System Error*\n\n*Error:* {clean_error_msg}\n*Time:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        
         error_msg = {
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "🚨 Power Transaction Alert System Error"
-                    }
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Error:* {clean_error_msg}\n*Time:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                    }
-                }
-            ]
+            "text": error_text
         }
         
-        requests.post(webhook_url, json=error_msg, timeout=30)
-        print("Error alert sent to Slack")
+        response = requests.post(webhook_url, json=error_msg, timeout=30)
+        print(f"Error alert sent to Slack - Response: {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Failed to send error alert: {str(e)}")
 
