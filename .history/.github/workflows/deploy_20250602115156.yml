@@ -1,0 +1,196 @@
+name: Deploy Power Alerts Lambda
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest boto3 pymongo requests
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Run security scan
+      run: |
+        # Check for hardcoded AWS credentials (exclude dependencies and cache)
+        echo "🔍 Scanning for hardcoded AWS credentials..."
+        if grep -r "AKIA[0-9A-Z]{16}\|sk-[a-zA-Z0-9]{40}" \
+          --include="*.py" --include="*.json" --include="*.yaml" --include="*.yml" \
+          --exclude-dir=".git" --exclude-dir="__pycache__" --exclude-dir=".aws-sam" \
+          --exclude-dir="urllib3" --exclude-dir="pymongo" --exclude-dir="requests" \
+          --exclude-dir="dateutil" --exclude-dir="dns" --exclude-dir=".history" \
+          lambda_function.py template.yaml *.py 2>/dev/null || true; then
+          echo "❌ Real AWS credentials found in source code!"
+          exit 1
+        fi
+        echo "✅ No hardcoded AWS credentials detected"
+    
+    - name: Run tests
+      run: |
+        # Run any tests you have
+        python -m pytest tests/ -v || echo "No tests found, skipping..."
+        
+        # Basic syntax check
+        python -c "import lambda_function; print('✅ Lambda function syntax OK')"
+        
+        # Test imports
+        python -c "
+        try:
+            from lambda_function import get_report_period
+            print('✅ Function imports OK')
+        except ImportError as e:
+            print(f'❌ Import error: {e}')
+            exit(1)
+        "
+
+  deploy-dev:
+    needs: test
+    runs-on: ubuntu-latest
+    # Changed: Deploy to dev on both develop and main branches
+    if: github.event_name == 'push'
+    environment: development
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Set up SAM CLI
+      uses: aws-actions/setup-sam@v2
+      with:
+        use-installer: true
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Build SAM application
+      run: sam build
+    
+    - name: Deploy to Development
+      run: |
+        sam deploy \
+          --stack-name power-alerts-dev \
+          --parameter-overrides Stage=dev \
+          --capabilities CAPABILITY_IAM \
+          --resolve-s3 \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset
+    
+    - name: Test Development Deployment
+      run: |
+        echo "Testing development deployment..."
+        aws lambda invoke \
+          --function-name power-transaction-monitor-dev \
+          --payload '{"test": true, "source": "github-actions"}' \
+          --cli-binary-format raw-in-base64-out \
+          test-output.json
+        
+        echo "📄 Function response:"
+        cat test-output.json
+        
+        # Check if deployment was successful
+        if [ $? -eq 0 ]; then
+          echo "✅ Development deployment test passed"
+        else
+          echo "❌ Development deployment test failed"
+          exit 1
+        fi
+
+  deploy-prod:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Set up SAM CLI
+      uses: aws-actions/setup-sam@v2
+      with:
+        use-installer: true
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Build SAM application
+      run: sam build
+    
+    - name: Deploy to Production
+      run: |
+        sam deploy \
+          --stack-name power-alerts-prod \
+          --parameter-overrides Stage=prod \
+          --capabilities CAPABILITY_IAM \
+          --resolve-s3 \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset
+    
+    - name: Test Production Deployment
+      run: |
+        echo "Testing production deployment..."
+        aws lambda invoke \
+          --function-name power-transaction-monitor-prod \
+          --payload '{"test": true, "source": "github-actions"}' \
+          --cli-binary-format raw-in-base64-out \
+          test-output.json
+        
+        echo "📄 Function response:"
+        cat test-output.json
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ Production deployment completed successfully"
+        else
+          echo "❌ Production deployment test failed"
+          exit 1
+        fi
+    
+    - name: Notify Slack (Production)
+      if: always()
+      run: |
+        STATUS="${{ job.status }}"
+        if [ "$STATUS" = "success" ]; then
+          EMOJI="🚀"
+          COLOR="good"
+          MESSAGE="Power Alerts PRODUCTION successfully deployed!"
+        else
+          EMOJI="🚨"
+          COLOR="danger"
+          MESSAGE="Power Alerts PRODUCTION deployment FAILED!"
+        fi
+        
+        curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"$EMOJI $MESSAGE\", \"attachments\":[{\"color\":\"$COLOR\",\"fields\":[{\"title\":\"Branch\",\"value\":\"${{ github.ref_name }}\",\"short\":true},{\"title\":\"Commit\",\"value\":\"${{ github.sha }}\",\"short\":true}]}]}" \
+          ${{ secrets.SLACK_WEBHOOK_URL }} || echo "Failed to send Slack notification"

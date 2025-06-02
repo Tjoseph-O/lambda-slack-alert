@@ -1,0 +1,204 @@
+name: Power Alerts CI/CD Pipeline
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+  pull_request:
+    branches: 
+      - main
+      - develop
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: 3.9
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest boto3 requests pymongo python-dotenv
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run security scan
+        run: |
+          # Check for hardcoded secrets (exclude dependencies and cache files)
+          echo "Scanning for potential secrets..."
+          if grep -r "AKIA[0-9A-Z]{16}\|sk-[a-zA-Z0-9]{40}" \
+            --include="*.py" --include="*.json" --include="*.yaml" --include="*.yml" \
+            --exclude-dir=".git" --exclude-dir="__pycache__" --exclude-dir=".aws-sam" \
+            --exclude-dir="urllib3" --exclude-dir="pymongo" --exclude-dir="requests" \
+            --exclude-dir="dateutil" --exclude-dir="dns" --exclude-dir=".history" \
+            .; then
+            echo "❌ Real AWS credentials found in source code!"
+            exit 1
+          fi
+          echo "✅ No hardcoded AWS credentials detected"
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: Lint code
+        run: |
+          python -m py_compile lambda_function.py
+          echo "✅ Code syntax check passed"
+
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: development
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Build SAM application
+        run: sam build
+
+      - name: Deploy to Development
+        run: |
+          sam deploy \
+            --stack-name power-alerts-dev \
+            --parameter-overrides Stage=dev \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Test Development Deployment
+        run: |
+          # Test the deployed Lambda function
+          echo "Testing development deployment..."
+          aws lambda invoke \
+            --function-name power-transaction-monitor-dev \
+            --payload '{"test": true}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          
+          # Check if function executed successfully
+          if [ $? -eq 0 ]; then
+            echo "✅ Development deployment test passed"
+          else
+            echo "❌ Development deployment test failed"
+            exit 1
+          fi
+
+      - name: Notify Slack (Dev)
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            COLOR="good"
+          else
+            EMOJI="❌"
+            COLOR="danger"
+          fi
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$EMOJI Power Alerts DEV Deployment $STATUS\", \"color\":\"$COLOR\"}" \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Build SAM application
+        run: sam build
+
+      - name: Deploy to Production
+        run: |
+          sam deploy \
+            --stack-name power-alerts-prod \
+            --parameter-overrides Stage=prod \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Test Production Deployment
+        run: |
+          echo "Testing production deployment..."
+          aws lambda invoke \
+            --function-name power-transaction-monitor-prod \
+            --payload '{"test": true}' \
+            --cli-binary-format raw-in-base64-out \
+            response.json
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Production deployment test passed"
+          else
+            echo "❌ Production deployment test failed"
+            exit 1
+          fi
+
+      - name: Notify Slack (Prod)
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="🚀"
+            COLOR="good"
+            MESSAGE="Power Alerts PRODUCTION successfully deployed!"
+          else
+            EMOJI="🚨"
+            COLOR="danger"
+            MESSAGE="Power Alerts PRODUCTION deployment FAILED!"
+          fi
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$EMOJI $MESSAGE\", \"color\":\"$COLOR\"}" \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
