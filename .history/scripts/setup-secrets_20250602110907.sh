@@ -46,7 +46,7 @@ echo "✅ All secrets have been securely stored!"
 echo "🔍 You can verify with:"
 echo "  aws ssm describe-parameters --filters Key=Name,Values=/power-alerts/$STAGE/"
 
-
+# Clear variables from memory
 unset MONGODB_URI
 unset MONGODB_DATABASE
 unset SLACK_WEBHOOK
