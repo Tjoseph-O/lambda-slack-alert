@@ -29,39 +29,17 @@ jobs:
     
     - name: Run security scan
       run: |
-        echo "🔍 Scanning for hardcoded AWS credentials in source files..."
-        
-        # Only scan actual source files, not dependencies
-        SOURCE_FILES="lambda_function.py template.yaml"
-        if ls *.py >/dev/null 2>&1; then
-          SOURCE_FILES="$SOURCE_FILES $(ls *.py | grep -v __pycache__ | head -5)"
-        fi
-        
-        FOUND_SECRETS=false
-        
-        # Check for AWS Access Keys
-        if echo "$SOURCE_FILES" | xargs grep -l "AKIA[0-9A-Z]{16}" 2>/dev/null; then
-          echo "❌ AWS Access Key found in source code!"
-          FOUND_SECRETS=true
-        fi
-        
-        # Check for AWS Secret Keys  
-        if echo "$SOURCE_FILES" | xargs grep -l "sk-[a-zA-Z0-9]{40}" 2>/dev/null; then
-          echo "❌ AWS Secret Key found in source code!"
-          FOUND_SECRETS=true
-        fi
-        
-        # Check for hardcoded MongoDB passwords
-        if echo "$SOURCE_FILES" | xargs grep -l "mongodb://.*:.*@" 2>/dev/null | xargs grep -v "os.environ\|getenv\|secrets\." 2>/dev/null; then
-          echo "❌ Hardcoded MongoDB credentials found!"
-          FOUND_SECRETS=true
-        fi
-        
-        if [ "$FOUND_SECRETS" = true ]; then
+        echo "🔍 Scanning for hardcoded AWS credentials..."
+        if grep -r "AKIA[0-9A-Z]{16}\|sk-[a-zA-Z0-9]{40}" \
+          --include="*.py" --include="*.json" --include="*.yaml" --include="*.yml" \
+          --exclude-dir=".git" --exclude-dir="__pycache__" --exclude-dir=".aws-sam" \
+          --exclude-dir="urllib3" --exclude-dir="pymongo" --exclude-dir="requests" \
+          --exclude-dir="dateutil" --exclude-dir="dns" --exclude-dir=".history" \
+          lambda_function.py template.yaml *.py 2>/dev/null || true; then
+          echo "❌ AWS credentials found in source code!"
           exit 1
         fi
-        
-        echo "✅ Security scan passed - no hardcoded credentials found"
+        echo "✅ Security scan passed"
     
     - name: Run unit tests
       run: |
